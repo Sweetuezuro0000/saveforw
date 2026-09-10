@@ -20,7 +20,14 @@ PORT = int(os.environ.get("PORT", 8080))
 MAX_WATERMARK_SIZE = 100 * 1024 * 1024 
 # =======================================================
 
-bot = Client("saver_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+bot = Client(
+    "saver_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+    ipv6=False
+)
 
 memory_db = {}
 user_clients = {}
