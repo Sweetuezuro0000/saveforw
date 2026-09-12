@@ -417,5 +417,49 @@ async def main():
     await bot.start()
     await asyncio.Event().wait()
 
+async def main():
+    print("🔵 STEP 1: main() started", flush=True)
+
+    print(f"🔵 STEP 2: Starting web server on port {PORT}", flush=True)
+
+    app = web.Application()
+    app.add_routes(routes)
+
+    runner = web.AppRunner(app)
+
+    try:
+        await runner.setup()
+        print("🟢 STEP 3: Web server setup OK", flush=True)
+
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+
+        print(f"🟢 STEP 4: Web server running on 0.0.0.0:{PORT}", flush=True)
+
+    except Exception as e:
+        print(f"🔴 WEB SERVER ERROR: {type(e).__name__}: {e}", flush=True)
+        raise
+
+    print("🔵 STEP 5: Starting Pyrogram bot...", flush=True)
+
+    try:
+        await bot.start()
+        print("🟢 STEP 6: Pyrogram bot STARTED successfully!", flush=True)
+        print("🤖 Bot is now running. Send /start on Telegram.", flush=True)
+
+    except Exception as e:
+        print(f"🔴 PYROGRAM START ERROR: {type(e).__name__}: {e}", flush=True)
+        raise
+
+    print("🔵 STEP 7: Keeping bot alive...", flush=True)
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        print("🟡 Shutting down...", flush=True)
+        await bot.stop()
+        await runner.cleanup()
+
+
 if __name__ == "__main__":
     asyncio.run(main())
