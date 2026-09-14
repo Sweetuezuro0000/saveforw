@@ -39,7 +39,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ----------------- LINK PARSER (TOPIC & PRIVATE SUPPORT) -----------------
+# ----------------- LINK PARSER -----------------
 def parse_telegram_link(link: str):
     # Private Topic: t.me/c/1234567890/99/456 -> (-1001234567890, 456)
     priv_topic = re.match(r"https?://t\.me/c/(\d+)/(\d+)/(\d+)", link)
@@ -74,13 +74,13 @@ def process_caption(orig_caption: str) -> str:
         caption = user_data["caption"]
     return caption.strip()
 
-# ----------------- WATERMARK (ONLY FOR FILES <= 100MB) -----------------
+# ----------------- WATERMARK (FILES <= 100MB) -----------------
 def apply_watermark(input_path, output_path, text):
     if not text:
         return input_path
     
     file_size = os.path.getsize(input_path)
-    if file_size > 100 * 1024 * 1024: # 100 MB Limit
+    if file_size > 100 * 1024 * 1024:
         return input_path
         
     ext = os.path.splitext(input_path)[1].lower()
@@ -104,15 +104,14 @@ async def start_cmd(client, message: Message):
     msg = (
         "🤖 **Save Restricted Content Bot Loaded!**\n\n"
         "**Commands List:**\n"
-        "🔹 `/setsession <StringSession>` - Login for 4GB & Restricted files\n"
-        "🔹 `/batch <link> <count>` - Extract up to 1000 files in 1 click\n"
+        "🔹 `/setsession <StringSession>` - Login for Restricted files\n"
+        "🔹 `/batch <link> <count>` - Extract files in batch\n"
         "🔹 `/setcaption <text>` / `/delcaption` - Manage Custom Caption\n"
         "🔹 `/remword <word>` - Remove specific words from caption\n"
         "🔹 `/replace <old> <new>` - Replace words in caption\n"
         "🔹 `/setthumb` - Reply to image to set Custom Thumbnail\n"
         "🔹 `/delthumb` - Remove Custom Thumbnail\n"
-        "🔹 `/watermark <text>` - Watermark Video/PDF (Files <= 100MB only)\n"
-        "🔹 `/logout` - Clear current session"
+        "🔹 `/watermark <text>` - Watermark Video/PDF\n"
     )
     await message.reply(msg)
 
@@ -184,7 +183,7 @@ async def set_watermark(client, message: Message):
     if message.from_user.id != OWNER_ID: return
     try:
         user_data["watermark"] = message.text.split(" ", 1)[1]
-        await message.reply(f"✅ **Watermark set to:** `{user_data['watermark']}`\n*(Note: Will apply only to files <= 100MB)*")
+        await message.reply(f"✅ **Watermark set to:** `{user_data['watermark']}`")
     except IndexError:
         user_data["watermark"] = None
         await message.reply("🗑️ **Watermark disabled.**")
@@ -210,14 +209,16 @@ async def batch_process(client: Client, message: Message):
     if not chat_id or not start_msg_id:
         return await message.reply("❌ **Invalid Telegram Link/Topic Format!**")
         
-    status_msg = await message.reply("⏳ **Initializing Session & Loading Access Hashes...**")
+    status_msg = await message.reply("⏳ **Initializing Session (No Updates Mode)...**")
     
+    # CRITICAL FIX: no_updates=True disables background update listener task
     user_app = Client(
         "UserSession",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=user_data["session"],
-        in_memory=True
+        in_memory=True,
+        no_updates=True
     )
     
     try:
@@ -225,9 +226,9 @@ async def batch_process(client: Client, message: Message):
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
 
-    # Load Dialogs to cache Channel Hashes in memory
+    # Cache channel hashes
     try:
-        async for _ in user_app.get_dialogs(limit=100):
+        async for _ in user_app.get_dialogs(limit=50):
             pass
     except Exception as e:
         print(f"Dialog load error: {e}")
@@ -235,90 +236,84 @@ async def batch_process(client: Client, message: Message):
     await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_id}`...**")
     
     success, failed = 0, 0
-    all_ids = [start_msg_id + i for i in range(count)]
-    chunk_size = 20  # Smaller chunks to prevent API errors
-
-    for i in range(0, len(all_ids), chunk_size):
-        chunk = all_ids[i:i + chunk_size]
-        
+    
+    for current_id in range(start_msg_id, start_msg_id + count):
         try:
-            fetched_messages = await user_app.get_messages(chat_id, chunk)
+            msg = await user_app.get_messages(chat_id, current_id)
         except FloodWait as e:
             await asyncio.sleep(e.value)
             try:
-                fetched_messages = await user_app.get_messages(chat_id, chunk)
+                msg = await user_app.get_messages(chat_id, current_id)
             except Exception as ex:
-                print(f"Error fetching chunk after wait: {ex}")
-                failed += len(chunk)
+                print(f"Error getting msg {current_id}: {ex}")
+                failed += 1
                 continue
         except Exception as e:
-            print(f"Error fetching message chunk: {e}")
-            failed += len(chunk)
+            print(f"Error fetching message {current_id}: {e}")
+            failed += 1
             continue
 
-        if not fetched_messages:
-            failed += len(chunk)
+        if not msg or msg.empty:
+            failed += 1
             continue
 
-        if not isinstance(fetched_messages, list):
-            fetched_messages = [fetched_messages]
+        try:
+            caption = process_caption(msg.caption or msg.text)
 
-        for msg in fetched_messages:
-            if not msg or msg.empty:
-                failed += 1
-                continue
+            if msg.media:
+                dl_msg = await message.reply_text(f"⬇️ Downloading message `{msg.id}`...")
+                file_path = await user_app.download_media(msg)
+                await dl_msg.delete()
 
-            try:
-                caption = process_caption(msg.caption or msg.text)
+                if not file_path or not os.path.exists(file_path):
+                    failed += 1
+                    continue
 
-                if msg.media:
-                    dl_msg = await message.reply_text(f"⬇️ Downloading message `{msg.id}`...")
-                    file_path = await user_app.download_media(msg)
-                    await dl_msg.delete()
+                # Apply Watermark
+                wm_path = file_path + "_wm.mp4"
+                final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
 
-                    if not file_path:
-                        failed += 1
-                        continue
+                # Thumbnail Setup
+                thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
 
-                    # Apply Watermark (Files <= 100MB)
-                    wm_path = file_path + "_wm.mp4"
-                    final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
+                # Upload back using main Bot
+                up_msg = await message.reply_text(f"⬆️ Uploading message `{msg.id}`...")
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=final_path,
+                    caption=caption,
+                    thumb=thumb
+                )
+                await up_msg.delete()
 
-                    # Thumbnail Setup
-                    thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
+                # Cleanup temp files
+                if os.path.exists(file_path): os.remove(file_path)
+                if os.path.exists(wm_path): os.remove(wm_path)
 
-                    # Upload back using User Session (Supports 4GB / Unlimited)
-                    up_msg = await message.reply_text(f"⬆️ Uploading message `{msg.id}`...")
-                    await user_app.send_document(
-                        chat_id=message.chat.id,
-                        document=final_path,
-                        caption=caption,
-                        thumb=thumb
-                    )
-                    await up_msg.delete()
+                success += 1
+            elif msg.text:
+                await client.send_message(chat_id=message.chat.id, text=caption)
+                success += 1
 
-                    # Cleanup temp files
-                    if os.path.exists(file_path): os.remove(file_path)
-                    if os.path.exists(wm_path): os.remove(wm_path)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            print(f"Error processing msg {current_id}: {e}")
+            traceback.print_exc()
+            failed += 1
 
-                    success += 1
-                elif msg.text:
-                    await user_app.send_message(chat_id=message.chat.id, text=caption)
-                    success += 1
+        await asyncio.sleep(1.5)
 
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                print(f"Error processing msg {msg.id}: {e}")
-                traceback.print_exc()
-                failed += 1
+        # Update progress every 5 items
+        if (current_id - start_msg_id + 1) % 5 == 0 or (current_id - start_msg_id + 1) == count:
+            processed = current_id - start_msg_id + 1
+            await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
 
-            await asyncio.sleep(1)
+    try:
+        await user_app.stop()
+    except Exception:
+        pass
 
-        processed = min(i + chunk_size, count)
-        await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
-
-    await user_app.stop()
     await status_msg.edit_text(f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`")
 
 # ----------------- MAIN EXECUTION -----------------
