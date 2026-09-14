@@ -1,4 +1,5 @@
-pyrogram
-tgcrypto
-aiohttp
-pypdf
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+aiohttp>=3.9.0
+pypdf>=4.0.0
+reportlab>=4.0.0
