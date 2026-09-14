@@ -1,465 +1,303 @@
-import asyncio
 import os
 import re
+import asyncio
 import subprocess
-from aiohttp import web
-from pypdf import PdfReader, PdfWriter
-
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
+from aiohttp import web
 
-# ==================== CONFIGURATION ====================
+# ----------------- CONFIGURATION -----------------
 API_ID = int(os.environ.get("API_ID", "11271546"))
 API_HASH = os.environ.get("API_HASH", "1f1f4621cde774fef16b39dd8274e982")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
-PORT = int(os.environ.get("PORT", 8080))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID = int(os.environ.get("OWNER_ID", "5787360401"))
 
-# Maximum file size for applying watermark (100 MB to protect server RAM/CPU)
-MAX_WATERMARK_SIZE = 100 * 1024 * 1024 
-# =======================================================
+bot = Client("SaveForwBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-bot = Client(
-    "saver_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True,
-    ipv6=False
-)
+# In-Memory Storage
+user_data = {
+    "session": None,
+    "thumb": None,
+    "caption": None,
+    "remwords": [],
+    "replace": {},
+    "watermark": None
+}
 
-memory_db = {}
-user_clients = {}
+# ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
+async def handle_ping(request):
+    return web.Response(text="Bot is running 24/7!")
 
-def get_user(user_id: int):
-    if user_id not in memory_db:
-        memory_db[user_id] = {
-            "_id": user_id,
-            "thumbnail": None,
-            "custom_caption": None,
-            "session_string": None,
-            "rem_words": [],
-            "rep_words": {},  # {"old_word": "new_word"}
-            "watermark_text": None
-        }
-    return memory_db[user_id]
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8088))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
-def update_user(user_id: int, data: dict):
-    user = get_user(user_id)
-    user.update(data)
+# ----------------- LINK PARSER (TOPIC & PRIVATE SUPPORT) -----------------
+def parse_telegram_link(link: str):
+    # Matches:
+    # 1. Private Topic: t.me/c/chat_id/topic_id/msg_id
+    # 2. Private Standard: t.me/c/chat_id/msg_id
+    # 3. Public Topic: t.me/channel/topic_id/msg_id
+    # 4. Public Standard: t.me/channel/msg_id
+    
+    priv_topic = re.match(r"https?://t\.me/c/(\d+)/(\d+)/(\d+)", link)
+    if priv_topic:
+        return int("-100" + priv_topic.group(1)), int(priv_topic.group(3))
+        
+    priv_std = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
+    if priv_std:
+        return int("-100" + priv_std.group(1)), int(priv_std.group(2))
+        
+    pub_topic = re.match(r"https?://t\.me/([^/]+)/(\d+)/(\d+)", link)
+    if pub_topic:
+        return pub_topic.group(1), int(pub_topic.group(3))
+        
+    pub_std = re.match(r"https?://t\.me/([^/]+)/(\d+)", link)
+    if pub_std:
+        return pub_std.group(1), int(pub_std.group(2))
+        
+    return None, None
 
-def process_caption(uid: int, original_caption: str) -> str:
-    user = get_user(uid)
-    if user.get("custom_caption"):
-        caption = user["custom_caption"]
-    else:
-        caption = original_caption or ""
-
-    if not caption:
-        return ""
-
-    # 1. Remove words
-    for word in user.get("rem_words", []):
-        caption = re.sub(re.escape(word), "", caption, flags=re.IGNORECASE)
-
-    # 2. Replace words
-    for old_w, new_w in user.get("rep_words", {}).items():
-        caption = re.sub(re.escape(old_w), new_w, caption, flags=re.IGNORECASE)
-
+# ----------------- CAPTION PROCESSOR -----------------
+def process_caption(orig_caption: str) -> str:
+    caption = orig_caption or ""
+    
+    # 1. Replace words
+    for old, new in user_data["replace"].items():
+        caption = caption.replace(old, new)
+        
+    # 2. Remove words
+    for word in user_data["remwords"]:
+        caption = caption.replace(word, "")
+        
+    # 3. Custom caption override
+    if user_data["caption"]:
+        caption = user_data["caption"]
+        
     return caption.strip()
 
-# ==================== ACCESS CONTROL ====================
-@bot.on_message(filters.private, group=-1)
-async def owner_check(client: Client, message: Message):
-    if message.from_user.id != OWNER_ID:
-        await message.reply_text("⛔ **Access Denied!** This is a private bot.")
-        message.stop_propagation()
+# ----------------- WATERMARK (ONLY FOR FILES <= 100MB) -----------------
+def apply_watermark(input_path, output_path, text):
+    if not text:
+        return input_path
+    
+    file_size = os.path.getsize(input_path)
+    # Strict Limit: 100 MB (100 * 1024 * 1024 bytes)
+    if file_size > 100 * 1024 * 1024:
+        return input_path
+        
+    ext = os.path.splitext(input_path)[1].lower()
+    
+    if ext in ['.mp4', '.mkv', '.avi', '.mov']:
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-vf", f"drawtext=text='{text}':x=(w-text_w)/2:y=h-th-30:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.5",
+            "-c:a", "copy", output_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return output_path if os.path.exists(output_path) else input_path
 
-# ==================== COMMAND HANDLERS ====================
+    return input_path
 
+# ----------------- COMMAND HANDLERS -----------------
 @bot.on_message(filters.command("start"))
-async def start_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    is_logged_in = "🟢 Connected" if user.get("session_string") else "🔴 Not Logged In"
-
-    text = (
-        "🚀 **Advanced Restricted Content Saver Bot**\n\n"
-        f"👤 **User Session Status:** `{is_logged_in}`\n"
-        f"🖼️ **Custom Thumbnail:** `{'Set' if user.get('thumbnail') else 'None'}`\n"
-        f"✍️ **Custom Caption:** `{'Set' if user.get('custom_caption') else 'None'}`\n"
-        f"💧 **Watermark Text:** `{user.get('watermark_text') or 'None'}`\n\n"
-        "📌 **Available Commands:**\n"
-        "• `/setsession <string>` - Login via Pyrogram String Session\n"
-        "• `/batch <start_link> <count>` - Bulk extraction (Up to 1000)\n"
-        "• `/setthumb` - Reply to an image to set thumbnail\n"
-        "• `/delthumb` - Remove custom thumbnail\n"
-        "• `/setcaption <text>` - Set static custom caption\n"
-        "• `/delcaption` - Remove custom caption\n"
-        "• `/remword <word>` - Remove specific word from caption\n"
-        "• `/replace <old> <new>` - Replace word in caption\n"
-        "• `/watermark <text>` - Watermark PDF/Video (Files <= 100MB)\n"
-        "• `/logout` - Clear user session"
+async def start_cmd(client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("⚠️ Unauthorized user!")
+    
+    msg = (
+        "🤖 **Save Restricted Content Bot Loaded!**\n\n"
+        "**Commands List:**\n"
+        "🔹 `/setsession <StringSession>` - Login for 4GB & Restricted files\n"
+        "🔹 `/batch <link> <count>` - Extract up to 1000 files in 1 click\n"
+        "🔹 `/setcaption <text>` / `/delcaption` - Manage Custom Caption\n"
+        "🔹 `/remword <word>` - Remove specific words from caption\n"
+        "🔹 `/replace <old> <new>` - Replace words in caption\n"
+        "🔹 `/setthumb` - Reply to image to set Custom Thumbnail\n"
+        "🔹 `/delthumb` - Remove Custom Thumbnail\n"
+        "🔹 `/watermark <text>` - Watermark Video/PDF (Files <= 100MB only)\n"
+        "🔹 `/logout` - Clear current session"
     )
-    await message.reply_text(text)
+    await message.reply(msg)
 
 @bot.on_message(filters.command("setsession"))
-async def set_session_cmd(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        return await message.reply_text("⚠️ **Format:** `/setsession <your_pyrogram_string_session>`")
-    
-    sess_str = args[1].strip()
-    uid = message.from_user.id
-    status_msg = await message.reply_text("🔄 Verifying session string...")
-
+async def set_session(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
     try:
-        test_client = Client(f"user_{uid}", api_id=API_ID, api_hash=API_HASH, session_string=sess_str, in_memory=True)
-        await test_client.start()
-        me = await test_client.get_me()
-        
-        update_user(uid, {"session_string": sess_str})
-        user_clients[uid] = test_client
-        
-        await status_msg.edit_text(f"✅ **Session Saved!** Connected as: `{me.first_name}` (`{me.id}`)")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ **Invalid Session String!**\nError: `{e}`")
-
-@bot.on_message(filters.command("setthumb"))
-async def set_thumb_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    if message.reply_to_message and message.reply_to_message.photo:
-        dl_path = await bot.download_media(message.reply_to_message.photo)
-        update_user(uid, {"thumbnail": dl_path})
-        await message.reply_text("✅ Custom thumbnail saved!")
-    else:
-        await message.reply_text("⚠️ Reply to a photo with `/setthumb` to save it as a thumbnail.")
-
-@bot.on_message(filters.command("delthumb"))
-async def del_thumb_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    user = get_user(uid)
-    if user.get("thumbnail") and os.path.exists(user["thumbnail"]):
-        os.remove(user["thumbnail"])
-    update_user(uid, {"thumbnail": None})
-    await message.reply_text("🗑️ Custom thumbnail removed.")
+        session_str = message.text.split(" ", 1)[1].strip()
+        user_data["session"] = session_str
+        await message.reply("✅ **Pyrogram String Session saved successfully!**")
+    except IndexError:
+        await message.reply("❌ **Usage:** `/setsession <your_string_session>`")
 
 @bot.on_message(filters.command("setcaption"))
-async def set_caption_cmd(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        update_user(message.from_user.id, {"custom_caption": args[1]})
-        await message.reply_text("✅ Custom caption set.")
-    else:
-        await message.reply_text("⚠️ **Format:** `/setcaption <your_caption_text>`")
+async def set_caption(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        user_data["caption"] = message.text.split(" ", 1)[1]
+        await message.reply("✅ **Custom Caption saved!**")
+    except IndexError:
+        await message.reply("❌ **Usage:** `/setcaption <your_caption_text>`")
 
 @bot.on_message(filters.command("delcaption"))
-async def del_caption_cmd(client: Client, message: Message):
-    update_user(message.from_user.id, {"custom_caption": None})
-    await message.reply_text("🗑️ Custom caption cleared.")
+async def del_caption(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    user_data["caption"] = None
+    await message.reply("🗑️ **Custom Caption removed.**")
 
 @bot.on_message(filters.command("remword"))
-async def rem_word_cmd(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        user = get_user(message.from_user.id)
-        user["rem_words"].append(args[1])
-        await message.reply_text(f"✅ Removal Word Added. Current list: `{user['rem_words']}`")
-    else:
-        await message.reply_text("⚠️ **Format:** `/remword <word_to_remove>`")
+async def rem_word(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        word = message.text.split(" ", 1)[1]
+        user_data["remwords"].append(word)
+        await message.reply(f"✅ **Word '{word}' added to removal list.**")
+    except IndexError:
+        await message.reply("❌ **Usage:** `/remword <word_to_remove>`")
 
 @bot.on_message(filters.command("replace"))
-async def replace_word_cmd(client: Client, message: Message):
-    args = message.text.split()
-    if len(args) >= 3:
-        old_w, new_w = args[1], args[2]
-        user = get_user(message.from_user.id)
-        user["rep_words"][old_w] = new_w
-        await message.reply_text(f"✅ Rule Added: Replace `{old_w}` with `{new_w}`")
-    else:
-        await message.reply_text("⚠️ **Format:** `/replace <old_word> <new_word>`")
+async def replace_word(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        _, old_word, new_word = message.text.split(" ", 2)
+        user_data["replace"][old_word] = new_word
+        await message.reply(f"✅ **Replacement set:** `{old_word}` ➔ `{new_word}`")
+    except ValueError:
+        await message.reply("❌ **Usage:** `/replace <old_word> <new_word>`")
+
+@bot.on_message(filters.command("setthumb"))
+async def set_thumb(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        return await message.reply("❌ Reply to a photo with `/setthumb` to set it.")
+    
+    path = await message.reply_to_message.download("./thumb.jpg")
+    user_data["thumb"] = path
+    await message.reply("✅ **Custom Thumbnail Saved!**")
+
+@bot.on_message(filters.command("delthumb"))
+async def del_thumb(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    if user_data["thumb"] and os.path.exists(user_data["thumb"]):
+        os.remove(user_data["thumb"])
+    user_data["thumb"] = None
+    await message.reply("🗑️ **Custom Thumbnail Removed.**")
 
 @bot.on_message(filters.command("watermark"))
-async def set_watermark(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        update_user(message.from_user.id, {"watermark_text": args[1]})
-        await message.reply_text(f"✅ Watermark set to: `{args[1]}`\n*(Applies only to files <= 100MB)*")
-    else:
-        update_user(message.from_user.id, {"watermark_text": None})
-        await message.reply_text("🗑️ Watermark disabled.")
+async def set_watermark(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        user_data["watermark"] = message.text.split(" ", 1)[1]
+        await message.reply(f"✅ **Watermark set to:** `{user_data['watermark']}`\n*(Note: Will apply only to files <= 100MB)*")
+    except IndexError:
+        user_data["watermark"] = None
+        await message.reply("🗑️ **Watermark disabled.**")
 
-@bot.on_message(filters.command("logout"))
-async def logout_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    update_user(uid, {"session_string": None})
-    if uid in user_clients:
-        try:
-            await user_clients[uid].stop()
-        except Exception:
-            pass
-        del user_clients[uid]
-    await message.reply_text("🚪 Session removed successfully.")
-
-# ==================== BATCH PROCESSING ====================
-
+# ----------------- BATCH PROCESSING CORE LOGIC -----------------
 @bot.on_message(filters.command("batch"))
-async def batch_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    args = message.text.split()
+async def batch_process(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    if not user_data["session"]:
+        return await message.reply("❌ **Please set Pyrogram session first using `/setsession`**")
     
+    args = message.text.split()
     if len(args) < 3:
-        return await message.reply_text(
-            "⚠️ **Format:** `/batch <start_message_link> <count_up_to_1000>`\n\n"
-            "**Example:** `/batch https://t.me/c/123456789/100 50`"
-        )
-
+        return await message.reply("❌ **Usage:** `/batch <start_link> <count>`\nExample: `/batch https://t.me/c/12345/10 500`")
+    
     start_link = args[1]
     try:
-        count = min(int(args[2]), 1000)
+        count = int(args[2])
     except ValueError:
-        return await message.reply_text("❌ Count must be a valid number!")
-
-    # Regex for standard and topic links
-    m_priv_topic = re.search(r"t\.me/c/(\d+)/(\d+)/(\d+)", start_link)
-    m_priv = re.search(r"t\.me/c/(\d+)/(\d+)", start_link)
-    m_pub = re.search(r"t\.me/([^/]+)/(\d+)", start_link)
-
-    if m_priv_topic:
-        chat_id = int("-100" + m_priv_topic.group(1))
-        start_id = int(m_priv_topic.group(3))
-        is_private = True
-    elif m_priv:
-        chat_id = int("-100" + m_priv.group(1))
-        start_id = int(m_priv.group(2))
-        is_private = True
-    elif m_pub:
-        chat_id = m_pub.group(1)
-        start_id = int(m_pub.group(2))
-        is_private = False
-    else:
-        return await message.reply_text("❌ Invalid message link!")
-
-    status = await message.reply_text(f"⏳ Processing batch task (0/{count})...")
-
+        return await message.reply("❌ **Count must be a valid number.**")
+        
+    chat_id, start_msg_id = parse_telegram_link(start_link)
+    if not chat_id or not start_msg_id:
+        return await message.reply("❌ **Invalid Telegram Link/Topic Format!**")
+        
+    status_msg = await message.reply(f"⏳ **Starting Batch Processing ({count} items)...**")
+    
+    # Initialize User Session Client (Supports 4GB & Restricted files)
+    user_app = Client("UserSession", api_id=API_ID, api_hash=API_HASH, session_string=user_data["session"])
+    await user_app.start()
+    
+    success, failed = 0, 0
+    
     for i in range(count):
-        current_msg_id = start_id + i
+        current_msg_id = start_msg_id + i
         try:
-            await process_single_post(uid, chat_id, current_msg_id, is_private)
-            if i % 5 == 0:
-                await status.edit_text(f"⏳ Processed ({i+1}/{count}) posts...")
-            await asyncio.sleep(2)  # Avoid Telegram FloodWait
+            msg = await user_app.get_messages(chat_id, current_msg_id)
+            if not msg or msg.empty:
+                failed += 1
+                continue
+                
+            # If message is media (Video, PDF, APKG, HTML, Document, Photo, Audio)
+            if msg.media:
+                caption = process_caption(msg.caption)
+                
+                # Direct Server Copy Try (0% Load)
+                try:
+                    await msg.copy(message.chat.id, caption=caption)
+                    success += 1
+                    continue
+                except RPCError:
+                    pass # Fallback to download-upload if restricted
+                    
+                # Download File (Supports up to 4GB)
+                dl_msg = await message.reply_text(f"⬇️ Downloading message `{current_msg_id}`...")
+                file_path = await user_app.download_media(msg)
+                await dl_msg.delete()
+                
+                if not file_path:
+                    failed += 1
+                    continue
+                    
+                # Apply Watermark (If <= 100MB)
+                wm_path = file_path + "_wm.mp4"
+                final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
+                
+                # Thumbnail Setup
+                thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
+                
+                # Upload back to User Chat
+                up_msg = await message.reply_text(f"⬆️ Uploading message `{current_msg_id}`...")
+                await user_app.send_document(
+                    chat_id=message.chat.id,
+                    document=final_path,
+                    caption=caption,
+                    thumb=thumb
+                )
+                await up_msg.delete()
+                
+                # Cleanup temp files
+                if os.path.exists(file_path): os.remove(file_path)
+                if os.path.exists(wm_path): os.remove(wm_path)
+                
+                success += 1
+            else:
+                # Text message copy
+                if msg.text:
+                    await message.reply_text(process_caption(msg.text))
+                    success += 1
+
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
-            print(f"Error processing message {current_msg_id}: {e}")
+            failed += 1
+            
+        if (i + 1) % 10 == 0:
+            await status_msg.edit_text(f"📊 **Progress:** `{i+1}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
+            
+    await user_app.stop()
+    await status_msg.edit_text(f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`")
 
-    await status.edit_text(f"✅ Batch completed! Total processed: {count}")
-
-# ==================== EXTRACTION ENGINE ====================
-
-async def process_single_post(uid: int, chat_id, msg_id: int, is_private: bool):
-    user = get_user(uid)
-    
-    if is_private:
-        user_session = user.get("session_string")
-        if not user_session:
-            raise Exception("Telegram User Session required for private links.")
-        
-        if uid not in user_clients:
-            u_client = Client(f"user_{uid}", api_id=API_ID, api_hash=API_HASH, session_string=user_session, in_memory=True)
-            await u_client.start()
-            user_clients[uid] = u_client
-        active_client = user_clients[uid]
-    else:
-        active_client = bot
-
-    # ------------------ STEP 1: Attempt Direct Server Copy (0% Server Load) ------------------
-    try:
-        t_msg = await active_client.get_messages(chat_id, msg_id)
-        if not t_msg or t_msg.empty:
-            return
-
-        cap = process_caption(uid, t_msg.caption.html if t_msg.caption else "")
-        
-        # Try direct server-side copy first if user hasn't set custom thumbnail or watermark
-        if not user.get("thumbnail") and not user.get("watermark_text"):
-            await active_client.copy_message(
-                chat_id=uid,
-                from_chat_id=chat_id,
-                message_id=msg_id,
-                caption=cap,
-                parse_mode=enums.ParseMode.HTML
-            )
-            return
-    except Exception:
-        # Fallback to download-upload flow if direct copy fails (Restricted content)
-        pass
-
-    # ------------------ STEP 2: Download & Upload Flow ------------------
-    if not t_msg.media:
-        text_content = process_caption(uid, t_msg.text.html if t_msg.text else "")
-        if text_content:
-            await bot.send_message(uid, text_content, parse_mode=enums.ParseMode.HTML)
-        return
-
-    dl_path = await active_client.download_media(t_msg)
-    if not dl_path:
-        return
-
-    out_path = dl_path
-    file_size = os.path.getsize(dl_path)
-    wm_text = user.get("watermark_text")
-
-    # Apply Watermark ONLY if file size <= 100 MB
-    if wm_text and file_size <= MAX_WATERMARK_SIZE:
-        if dl_path.endswith(".pdf"):
-            out_path = apply_pdf_watermark(dl_path, wm_text)
-        elif dl_path.endswith((".mp4", ".mkv", ".mov")):
-            out_path = apply_video_watermark(dl_path, wm_text)
-
-    th = user.get("thumbnail")
-
-    # Use User Client if file size > 2 GB (Telegram Bot API limit)
-    sender_client = active_client if (file_size > 2 * 1024 * 1024 * 1024 and is_private) else bot
-
-    try:
-        if t_msg.video:
-            await sender_client.send_video(uid, out_path, caption=cap, thumb=th, parse_mode=enums.ParseMode.HTML)
-        elif t_msg.photo:
-            await sender_client.send_photo(uid, out_path, caption=cap, parse_mode=enums.ParseMode.HTML)
-        elif t_msg.document:
-            await sender_client.send_document(uid, out_path, caption=cap, thumb=th, parse_mode=enums.ParseMode.HTML)
-    finally:
-        # Clean up temporary files from disk immediately
-        if os.path.exists(dl_path):
-            os.remove(dl_path)
-        if out_path != dl_path and os.path.exists(out_path):
-            os.remove(out_path)
-
-# ==================== WATERMARK PROCESSING ====================
-
-def apply_pdf_watermark(pdf_path: str, text: str) -> str:
-    try:
-        reader = PdfReader(pdf_path)
-        writer = PdfWriter()
-        for page in reader.pages:
-            writer.add_page(page)
-        out_path = f"wm_{pdf_path}"
-        with open(out_path, "wb") as f:
-            writer.write(f)
-        return out_path
-    except Exception:
-        return pdf_path
-
-def apply_video_watermark(video_path: str, text: str) -> str:
-    out_path = f"wm_{video_path}"
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vf", f"drawtext=text='{text}':x=10:y=H-th-10:fontsize=24:fontcolor=white@0.8",
-        "-c:a", "copy", out_path
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return out_path
-    except Exception:
-        return video_path
-
-# ==================== LINK HANDLER ====================
-
-@bot.on_message(filters.private & ~filters.command([
-    "start", "setsession", "setthumb", "delthumb", "setcaption", "delcaption",
-    "remword", "replace", "watermark", "batch", "logout"
-]))
-async def handle_links(client: Client, message: Message):
-    uid = message.from_user.id
-    text = message.text.strip() if message.text else ""
-
-    if "t.me/" in text:
-        st = await message.reply_text("⚡ Extracting content...")
-
-        m_priv_topic = re.search(r"t\.me/c/(\d+)/(\d+)/(\d+)", text)
-        m_priv = re.search(r"t\.me/c/(\d+)/(\d+)", text)
-        m_pub = re.search(r"t\.me/([^/]+)/(\d+)", text)
-
-        if m_priv_topic:
-            chat_id = int("-100" + m_priv_topic.group(1))
-            msg_id = int(m_priv_topic.group(3))
-            is_private = True
-        elif m_priv:
-            chat_id = int("-100" + m_priv.group(1))
-            msg_id = int(m_priv.group(2))
-            is_private = True
-        elif m_pub:
-            chat_id = m_pub.group(1)
-            msg_id = int(m_pub.group(2))
-            is_private = False
-        else:
-            return await st.edit_text("❌ Invalid Telegram link!")
-
-        try:
-            await process_single_post(uid, chat_id, msg_id, is_private)
-            await st.delete()
-        except Exception as e:
-            await st.edit_text(f"❌ Error: `{e}`")
-
-# ==================== WEB SERVER ====================
-routes = web.RouteTableDef()
-@routes.get("/", allow_head=True)
-async def root_route_handler(request):
-    return web.json_response({"status": "running"})
-
-async def main():
-    app = web.AppRunner(web.Application())
-    await app.setup()
-    await web.TCPSite(app, "0.0.0.0", PORT).start()
-    await bot.start()
-    await asyncio.Event().wait()
-
-async def main():
-    print("🔵 STEP 1: main() started", flush=True)
-
-    print(f"🔵 STEP 2: Starting web server on port {PORT}", flush=True)
-
-    app = web.Application()
-    app.add_routes(routes)
-
-    runner = web.AppRunner(app)
-
-    try:
-        await runner.setup()
-        print("🟢 STEP 3: Web server setup OK", flush=True)
-
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-
-        print(f"🟢 STEP 4: Web server running on 0.0.0.0:{PORT}", flush=True)
-
-    except Exception as e:
-        print(f"🔴 WEB SERVER ERROR: {type(e).__name__}: {e}", flush=True)
-        raise
-
-    print("🔵 STEP 5: Starting Pyrogram bot...", flush=True)
-
-    try:
-        await bot.start()
-        print("🟢 STEP 6: Pyrogram bot STARTED successfully!", flush=True)
-        print("🤖 Bot is now running. Send /start on Telegram.", flush=True)
-
-    except Exception as e:
-        print(f"🔴 PYROGRAM START ERROR: {type(e).__name__}: {e}", flush=True)
-        raise
-
-    print("🔵 STEP 7: Keeping bot alive...", flush=True)
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        print("🟡 Shutting down...", flush=True)
-        await bot.stop()
-        await runner.cleanup()
-
-
+# ----------------- MAIN EXECUTION -----------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
+    bot.run()
