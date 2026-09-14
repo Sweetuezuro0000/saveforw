@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import subprocess
+import traceback
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError, ChannelPrivate, UserNotParticipant
@@ -209,9 +210,8 @@ async def batch_process(client: Client, message: Message):
     if not chat_id or not start_msg_id:
         return await message.reply("❌ **Invalid Telegram Link/Topic Format!**")
         
-    status_msg = await message.reply(f"⏳ **Initializing Session & Checking Access...**")
+    status_msg = await message.reply("⏳ **Initializing Session & Loading Access Hashes...**")
     
-    # in_memory=True prevents database lock on Render
     user_app = Client(
         "UserSession",
         api_id=API_ID,
@@ -225,20 +225,18 @@ async def batch_process(client: Client, message: Message):
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
 
-    # Verify if user session account is joined in private channel
+    # Load Dialogs to cache Channel Hashes in memory
     try:
-        await user_app.get_chat(chat_id)
-    except (ChannelPrivate, UserNotParticipant):
-        await user_app.stop()
-        return await status_msg.edit_text("❌ **Access Denied!**\nThe account connected via `/setsession` is **NOT a member** of this private channel/group. Please join the private channel with that Telegram account first!")
-    except Exception:
-        pass
+        async for _ in user_app.get_dialogs(limit=100):
+            pass
+    except Exception as e:
+        print(f"Dialog load error: {e}")
 
     await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_id}`...**")
     
     success, failed = 0, 0
     all_ids = [start_msg_id + i for i in range(count)]
-    chunk_size = 50
+    chunk_size = 20  # Smaller chunks to prevent API errors
 
     for i in range(0, len(all_ids), chunk_size):
         chunk = all_ids[i:i + chunk_size]
@@ -247,12 +245,19 @@ async def batch_process(client: Client, message: Message):
             fetched_messages = await user_app.get_messages(chat_id, chunk)
         except FloodWait as e:
             await asyncio.sleep(e.value)
-            fetched_messages = await user_app.get_messages(chat_id, chunk)
-        except Exception:
+            try:
+                fetched_messages = await user_app.get_messages(chat_id, chunk)
+            except Exception as ex:
+                print(f"Error fetching chunk after wait: {ex}")
+                failed += len(chunk)
+                continue
+        except Exception as e:
+            print(f"Error fetching message chunk: {e}")
             failed += len(chunk)
             continue
 
         if not fetched_messages:
+            failed += len(chunk)
             continue
 
         if not isinstance(fetched_messages, list):
@@ -282,9 +287,9 @@ async def batch_process(client: Client, message: Message):
                     # Thumbnail Setup
                     thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
 
-                    # Upload back using BOT client
+                    # Upload back using User Session (Supports 4GB / Unlimited)
                     up_msg = await message.reply_text(f"⬆️ Uploading message `{msg.id}`...")
-                    await client.send_document(
+                    await user_app.send_document(
                         chat_id=message.chat.id,
                         document=final_path,
                         caption=caption,
@@ -298,12 +303,14 @@ async def batch_process(client: Client, message: Message):
 
                     success += 1
                 elif msg.text:
-                    await client.send_message(chat_id=message.chat.id, text=caption)
+                    await user_app.send_message(chat_id=message.chat.id, text=caption)
                     success += 1
 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-            except Exception:
+            except Exception as e:
+                print(f"Error processing msg {msg.id}: {e}")
+                traceback.print_exc()
                 failed += 1
 
             await asyncio.sleep(1)
