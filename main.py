@@ -134,8 +134,8 @@ async def set_session(client, message: Message):
         user_data["session"] = session_str
         await message.reply("✅ **Pyrogram String Session saved successfully!**")
     except IndexError:
-        await message.reply("❌ **Usage:** `/setsession <your_string_session>`")
-
+        await message.reply("❌ **Usage:** `/setsession StringSessionHere`")
+        
 @bot.on_message(filters.command("setcaption"))
 async def set_caption(client, message: Message):
     if message.from_user.id != OWNER_ID: return
@@ -208,8 +208,8 @@ async def batch_process(client, message: Message):
     
     args = message.text.split()
     if len(args) < 3:
-        return await message.reply("❌ **Usage:** `/batch <start_link> <count>`\nExample: `/batch https://t.me/c/12345/10 500`")
-    
+        return await message.reply("❌ **Usage:** `/batch Link 500`\nExample: `/batch https://t.me/c/12345/10 500`")
+        
     start_link = args[1]
     try:
         count = int(args[2])
