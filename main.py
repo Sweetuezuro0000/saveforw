@@ -4,7 +4,7 @@ import asyncio
 import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, ChannelPrivate, UserNotParticipant
 from aiohttp import web
 
 # ----------------- CONFIGURATION -----------------
@@ -40,24 +40,22 @@ async def start_web_server():
 
 # ----------------- LINK PARSER (TOPIC & PRIVATE SUPPORT) -----------------
 def parse_telegram_link(link: str):
-    # Matches:
-    # 1. Private Topic: t.me/c/chat_id/topic_id/msg_id
-    # 2. Private Standard: t.me/c/chat_id/msg_id
-    # 3. Public Topic: t.me/channel/topic_id/msg_id
-    # 4. Public Standard: t.me/channel/msg_id
-    
+    # Private Topic: t.me/c/1234567890/99/456 -> (-1001234567890, 456)
     priv_topic = re.match(r"https?://t\.me/c/(\d+)/(\d+)/(\d+)", link)
     if priv_topic:
         return int("-100" + priv_topic.group(1)), int(priv_topic.group(3))
         
+    # Private Standard: t.me/c/1234567890/456 -> (-1001234567890, 456)
     priv_std = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
     if priv_std:
         return int("-100" + priv_std.group(1)), int(priv_std.group(2))
         
+    # Public Topic: t.me/channelname/99/456 -> ("channelname", 456)
     pub_topic = re.match(r"https?://t\.me/([^/]+)/(\d+)/(\d+)", link)
     if pub_topic:
         return pub_topic.group(1), int(pub_topic.group(3))
         
+    # Public Standard: t.me/channelname/456 -> ("channelname", 456)
     pub_std = re.match(r"https?://t\.me/([^/]+)/(\d+)", link)
     if pub_std:
         return pub_std.group(1), int(pub_std.group(2))
@@ -67,19 +65,12 @@ def parse_telegram_link(link: str):
 # ----------------- CAPTION PROCESSOR -----------------
 def process_caption(orig_caption: str) -> str:
     caption = orig_caption or ""
-    
-    # 1. Replace words
     for old, new in user_data["replace"].items():
         caption = caption.replace(old, new)
-        
-    # 2. Remove words
     for word in user_data["remwords"]:
         caption = caption.replace(word, "")
-        
-    # 3. Custom caption override
     if user_data["caption"]:
         caption = user_data["caption"]
-        
     return caption.strip()
 
 # ----------------- WATERMARK (ONLY FOR FILES <= 100MB) -----------------
@@ -88,12 +79,10 @@ def apply_watermark(input_path, output_path, text):
         return input_path
     
     file_size = os.path.getsize(input_path)
-    # Strict Limit: 100 MB (100 * 1024 * 1024 bytes)
-    if file_size > 100 * 1024 * 1024:
+    if file_size > 100 * 1024 * 1024: # 100 MB Limit
         return input_path
         
     ext = os.path.splitext(input_path)[1].lower()
-    
     if ext in ['.mp4', '.mkv', '.avi', '.mov']:
         cmd = [
             "ffmpeg", "-y", "-i", input_path,
@@ -135,7 +124,7 @@ async def set_session(client, message: Message):
         await message.reply("✅ **Pyrogram String Session saved successfully!**")
     except IndexError:
         await message.reply("❌ **Usage:** `/setsession StringSessionHere`")
-        
+
 @bot.on_message(filters.command("setcaption"))
 async def set_caption(client, message: Message):
     if message.from_user.id != OWNER_ID: return
@@ -199,17 +188,17 @@ async def set_watermark(client, message: Message):
         user_data["watermark"] = None
         await message.reply("🗑️ **Watermark disabled.**")
 
-# ----------------- BATCH PROCESSING CORE LOGIC -----------------
+# ----------------- BATCH PROCESSING LOGIC -----------------
 @bot.on_message(filters.command("batch"))
-async def batch_process(client, message: Message):
+async def batch_process(client: Client, message: Message):
     if message.from_user.id != OWNER_ID: return
     if not user_data["session"]:
         return await message.reply("❌ **Please set Pyrogram session first using `/setsession`**")
     
     args = message.text.split()
     if len(args) < 3:
-        return await message.reply("❌ **Usage:** `/batch Link 500`\nExample: `/batch https://t.me/c/12345/10 500`")
-        
+        return await message.reply("❌ **Usage:** `/batch <start_link> <count>`\nExample: `/batch https://t.me/c/12345/10 500`")
+    
     start_link = args[1]
     try:
         count = int(args[2])
@@ -220,79 +209,108 @@ async def batch_process(client, message: Message):
     if not chat_id or not start_msg_id:
         return await message.reply("❌ **Invalid Telegram Link/Topic Format!**")
         
-    status_msg = await message.reply(f"⏳ **Starting Batch Processing ({count} items)...**")
+    status_msg = await message.reply(f"⏳ **Initializing Session & Checking Access...**")
     
-    # Initialize User Session Client (Supports 4GB & Restricted files)
-    user_app = Client("UserSession", api_id=API_ID, api_hash=API_HASH, session_string=user_data["session"])
-    await user_app.start()
+    # in_memory=True prevents database lock on Render
+    user_app = Client(
+        "UserSession",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=user_data["session"],
+        in_memory=True
+    )
+    
+    try:
+        await user_app.start()
+    except Exception as e:
+        return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
+
+    # Verify if user session account is joined in private channel
+    try:
+        await user_app.get_chat(chat_id)
+    except (ChannelPrivate, UserNotParticipant):
+        await user_app.stop()
+        return await status_msg.edit_text("❌ **Access Denied!**\nThe account connected via `/setsession` is **NOT a member** of this private channel/group. Please join the private channel with that Telegram account first!")
+    except Exception:
+        pass
+
+    await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_id}`...**")
     
     success, failed = 0, 0
-    
-    for i in range(count):
-        current_msg_id = start_msg_id + i
+    all_ids = [start_msg_id + i for i in range(count)]
+    chunk_size = 50
+
+    for i in range(0, len(all_ids), chunk_size):
+        chunk = all_ids[i:i + chunk_size]
+        
         try:
-            msg = await user_app.get_messages(chat_id, current_msg_id)
+            fetched_messages = await user_app.get_messages(chat_id, chunk)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            fetched_messages = await user_app.get_messages(chat_id, chunk)
+        except Exception:
+            failed += len(chunk)
+            continue
+
+        if not fetched_messages:
+            continue
+
+        if not isinstance(fetched_messages, list):
+            fetched_messages = [fetched_messages]
+
+        for msg in fetched_messages:
             if not msg or msg.empty:
                 failed += 1
                 continue
-                
-            # If message is media (Video, PDF, APKG, HTML, Document, Photo, Audio)
-            if msg.media:
-                caption = process_caption(msg.caption)
-                
-                # Direct Server Copy Try (0% Load)
-                try:
-                    await msg.copy(message.chat.id, caption=caption)
+
+            try:
+                caption = process_caption(msg.caption or msg.text)
+
+                if msg.media:
+                    dl_msg = await message.reply_text(f"⬇️ Downloading message `{msg.id}`...")
+                    file_path = await user_app.download_media(msg)
+                    await dl_msg.delete()
+
+                    if not file_path:
+                        failed += 1
+                        continue
+
+                    # Apply Watermark (Files <= 100MB)
+                    wm_path = file_path + "_wm.mp4"
+                    final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
+
+                    # Thumbnail Setup
+                    thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
+
+                    # Upload back using BOT client
+                    up_msg = await message.reply_text(f"⬆️ Uploading message `{msg.id}`...")
+                    await client.send_document(
+                        chat_id=message.chat.id,
+                        document=final_path,
+                        caption=caption,
+                        thumb=thumb
+                    )
+                    await up_msg.delete()
+
+                    # Cleanup temp files
+                    if os.path.exists(file_path): os.remove(file_path)
+                    if os.path.exists(wm_path): os.remove(wm_path)
+
                     success += 1
-                    continue
-                except RPCError:
-                    pass # Fallback to download-upload if restricted
-                    
-                # Download File (Supports up to 4GB)
-                dl_msg = await message.reply_text(f"⬇️ Downloading message `{current_msg_id}`...")
-                file_path = await user_app.download_media(msg)
-                await dl_msg.delete()
-                
-                if not file_path:
-                    failed += 1
-                    continue
-                    
-                # Apply Watermark (If <= 100MB)
-                wm_path = file_path + "_wm.mp4"
-                final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
-                
-                # Thumbnail Setup
-                thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
-                
-                # Upload back to User Chat
-                up_msg = await message.reply_text(f"⬆️ Uploading message `{current_msg_id}`...")
-                await user_app.send_document(
-                    chat_id=message.chat.id,
-                    document=final_path,
-                    caption=caption,
-                    thumb=thumb
-                )
-                await up_msg.delete()
-                
-                # Cleanup temp files
-                if os.path.exists(file_path): os.remove(file_path)
-                if os.path.exists(wm_path): os.remove(wm_path)
-                
-                success += 1
-            else:
-                # Text message copy
-                if msg.text:
-                    await message.reply_text(process_caption(msg.text))
+                elif msg.text:
+                    await client.send_message(chat_id=message.chat.id, text=caption)
                     success += 1
 
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            failed += 1
-            
-        if (i + 1) % 10 == 0:
-            await status_msg.edit_text(f"📊 **Progress:** `{i+1}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
-            
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                failed += 1
+
+            await asyncio.sleep(1)
+
+        processed = min(i + chunk_size, count)
+        await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
+
     await user_app.stop()
     await status_msg.edit_text(f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`")
 
