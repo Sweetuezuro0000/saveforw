@@ -1,8 +1,6 @@
 import os
 import re
 import asyncio
-import subprocess
-import traceback
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
@@ -19,13 +17,11 @@ bot = Client("SaveForwBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 # In-Memory Storage
 user_data = {
     "session": None,
-    "thumb": None,
     "caption": None,
     "remwords": [],
     "replace": {},
-    "watermark": None,
-    "target_chat": None,  # Target Group Chat ID
-    "target_topic": None  # Target Topic ID
+    "target_chat": None,
+    "target_topic": None
 }
 
 # ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
@@ -78,27 +74,6 @@ def process_caption(orig_caption: str) -> str:
         caption = user_data["caption"]
     return caption.strip()
 
-# ----------------- WATERMARK (FILES <= 100MB) -----------------
-def apply_watermark(input_path, output_path, text):
-    if not text:
-        return input_path
-    
-    file_size = os.path.getsize(input_path)
-    if file_size > 100 * 1024 * 1024:
-        return input_path
-        
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext in ['.mp4', '.mkv', '.avi', '.mov']:
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-vf", f"drawtext=text='{text}':x=(w-text_w)/2:y=h-th-30:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.5",
-            "-c:a", "copy", output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return output_path if os.path.exists(output_path) else input_path
-
-    return input_path
-
 # ----------------- COMMAND HANDLERS -----------------
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message: Message):
@@ -106,18 +81,15 @@ async def start_cmd(client, message: Message):
         return await message.reply("⚠️ Unauthorized user!")
     
     msg = (
-        "🤖 **Save Restricted Content Bot Loaded!**\n\n"
+        "🤖 **Fast Direct-Copy Bot Loaded!**\n\n"
         "**Commands List:**\n"
         "🔹 `/setsession <StringSession>` - Save Pyrogram Session\n"
         "🔹 `/settarget <TopicLink>` - Set destination Group Topic\n"
         "🔹 `/deltarget` - Reset target back to Bot DM\n"
-        "🔹 `/batch <link> <count>` - Extract files in batch\n"
+        "🔹 `/batch <link> <count>` - Copy files in batch (Instant)\n"
         "🔹 `/setcaption <text>` / `/delcaption` - Manage Custom Caption\n"
         "🔹 `/remword <word>` - Remove specific words\n"
         "🔹 `/replace <old> <new>` - Replace words\n"
-        "🔹 `/setthumb` - Reply to image to set Thumbnail\n"
-        "🔹 `/delthumb` - Delete Thumbnail\n"
-        "🔹 `/watermark <text>` - Watermark Video\n"
     )
     await message.reply(msg)
 
@@ -146,7 +118,7 @@ async def set_target_topic(client, message: Message):
             f"🎯 **Target Topic Saved Successfully!**\n\n"
             f"📌 **Group ID:** `{chat_id}`\n"
             f"📌 **Topic ID:** `{topic_id}`\n\n"
-            f"All extracted files will now be sent directly to this Topic."
+            f"All extracted files will now be copied directly to this Topic."
         )
     except IndexError:
         await message.reply("❌ **Usage:** `/settarget https://t.me/c/1234567890/55`")
@@ -156,7 +128,7 @@ async def del_target_topic(client, message: Message):
     if message.from_user.id != OWNER_ID: return
     user_data["target_chat"] = None
     user_data["target_topic"] = None
-    await message.reply("🗑️ **Target Topic Removed.** Files will now be sent to Bot DM.")
+    await message.reply("🗑️ **Target Topic Removed.** Files will now be copied to Bot DM.")
 
 @bot.on_message(filters.command("setcaption"))
 async def set_caption(client, message: Message):
@@ -193,35 +165,7 @@ async def replace_word(client, message: Message):
     except ValueError:
         await message.reply("❌ **Usage:** `/replace <old_word> <new_word>`")
 
-@bot.on_message(filters.command("setthumb"))
-async def set_thumb(client, message: Message):
-    if message.from_user.id != OWNER_ID: return
-    if not message.reply_to_message or not message.reply_to_message.photo:
-        return await message.reply("❌ Reply to a photo with `/setthumb` to set it.")
-    
-    path = await message.reply_to_message.download("./thumb.jpg")
-    user_data["thumb"] = path
-    await message.reply("✅ **Custom Thumbnail Saved!**")
-
-@bot.on_message(filters.command("delthumb"))
-async def del_thumb(client, message: Message):
-    if message.from_user.id != OWNER_ID: return
-    if user_data["thumb"] and os.path.exists(user_data["thumb"]):
-        os.remove(user_data["thumb"])
-    user_data["thumb"] = None
-    await message.reply("🗑️ **Custom Thumbnail Removed.**")
-
-@bot.on_message(filters.command("watermark"))
-async def set_watermark(client, message: Message):
-    if message.from_user.id != OWNER_ID: return
-    try:
-        user_data["watermark"] = message.text.split(" ", 1)[1]
-        await message.reply(f"✅ **Watermark set to:** `{user_data['watermark']}`")
-    except IndexError:
-        user_data["watermark"] = None
-        await message.reply("🗑️ **Watermark disabled.**")
-
-# ----------------- BATCH PROCESSING LOGIC -----------------
+# ----------------- BATCH PROCESSING LOGIC (DIRECT SERVER COPY) -----------------
 @bot.on_message(filters.command("batch"))
 async def batch_process(client: Client, message: Message):
     if message.from_user.id != OWNER_ID: return
@@ -277,7 +221,7 @@ async def batch_process(client: Client, message: Message):
     dest_chat = user_data["target_chat"] or message.chat.id
     dest_topic = user_data["target_topic"] if user_data["target_chat"] else None
 
-    await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_obj.title or chat_id}`...**")
+    await status_msg.edit_text(f"🚀 **Fast Copying {count} items from `{chat_obj.title or chat_id}`...**")
     
     success, failed = 0, 0
     last_error = ""
@@ -307,54 +251,16 @@ async def batch_process(client: Client, message: Message):
             caption = process_caption(msg.caption or msg.text)
 
             if msg.media:
-                dl_msg = await message.reply_text(f"⬇️ Downloading msg `{msg.id}`...")
-                file_path = await user_app.download_media(msg)
-                await dl_msg.delete()
+                copy_args = {
+                    "chat_id": dest_chat,
+                    "caption": caption
+                }
+                if dest_topic:
+                    copy_args["reply_to_message_id"] = dest_topic
 
-                if not file_path or not os.path.exists(file_path):
-                    last_error = "Download failed"
-                    failed += 1
-                    continue
-
-                # Watermark
-                wm_path = file_path + "_wm.mp4"
-                final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
-                thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
-
-                # Upload Logic: Check if file is video
-                up_msg = await message.reply_text(f"⬆️ Uploading msg `{msg.id}`...")
-                ext = os.path.splitext(final_path)[1].lower()
-                is_video = ext in ['.mp4', '.mkv', '.avi', '.mov'] or bool(msg.video)
-
-                if is_video:
-                    upload_args = {
-                        "chat_id": dest_chat,
-                        "video": final_path,
-                        "caption": caption,
-                        "thumb": thumb,
-                        "supports_streaming": True
-                    }
-                    if dest_topic:
-                        upload_args["reply_to_message_id"] = dest_topic
-                    await client.send_video(**upload_args)
-                else:
-                    upload_args = {
-                        "chat_id": dest_chat,
-                        "document": final_path,
-                        "caption": caption,
-                        "thumb": thumb
-                    }
-                    if dest_topic:
-                        upload_args["reply_to_message_id"] = dest_topic
-                    await client.send_document(**upload_args)
-
-                await up_msg.delete()
-
-                # Cleanup
-                if os.path.exists(file_path): os.remove(file_path)
-                if os.path.exists(wm_path): os.remove(wm_path)
-
+                await msg.copy(**copy_args)
                 success += 1
+
             elif msg.text:
                 send_args = {
                     "chat_id": dest_chat,
@@ -363,20 +269,20 @@ async def batch_process(client: Client, message: Message):
                 if dest_topic:
                     send_args["reply_to_message_id"] = dest_topic
                     
-                await client.send_message(**send_args)
+                await user_app.send_message(**send_args)
                 success += 1
 
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
-            last_error = f"Process/Upload Error: {e}"
+            last_error = f"Copy Error: {e}"
             failed += 1
 
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.5)
 
         # Update status
         processed = current_id - start_msg_id + 1
-        if processed % 5 == 0 or processed == count:
+        if processed % 10 == 0 or processed == count:
             await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
 
     try:
