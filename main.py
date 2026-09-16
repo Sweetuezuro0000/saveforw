@@ -263,8 +263,15 @@ async def batch_process(client: Client, message: Message):
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
 
+    # Load Dialogs to build Peer Cache (Fixes "Peer ID Invalid" issue)
+    await status_msg.edit_text("⏳ **Loading Dialogs & Resolving Channel Access...**")
+    try:
+        async for _ in user_app.get_dialogs(limit=200):
+            pass
+    except Exception as e:
+        print(f"Dialog load error: {e}")
+
     # Resolve Channel Access
-    await status_msg.edit_text("⏳ **Resolving Private Channel Access...**")
     try:
         chat_obj = await user_app.get_chat(chat_id)
     except Exception as e:
@@ -315,6 +322,64 @@ async def batch_process(client: Client, message: Message):
                     continue
 
                 # Watermark
+                wm_path = file_path + "_wm.mp4"
+                final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
+                thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
+
+                # Upload to Target Group Topic or DM
+                up_msg = await message.reply_text(f"⬆️ Uploading msg `{msg.id}`...")
+                
+                upload_args = {
+                    "chat_id": dest_chat,
+                    "document": final_path,
+                    "caption": caption,
+                    "thumb": thumb
+                }
+                if dest_topic:
+                    upload_args["reply_to_message_id"] = dest_topic
+
+                await client.send_document(**upload_args)
+                await up_msg.delete()
+
+                # Cleanup
+                if os.path.exists(file_path): os.remove(file_path)
+                if os.path.exists(wm_path): os.remove(wm_path)
+
+                success += 1
+            elif msg.text:
+                send_args = {
+                    "chat_id": dest_chat,
+                    "text": caption
+                }
+                if dest_topic:
+                    send_args["reply_to_message_id"] = dest_topic
+                    
+                await client.send_message(**send_args)
+                success += 1
+
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            last_error = f"Process/Upload Error: {e}"
+            failed += 1
+
+        await asyncio.sleep(1.2)
+
+        # Update status
+        processed = current_id - start_msg_id + 1
+        if processed % 5 == 0 or processed == count:
+            await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
+
+    try:
+        await user_app.stop()
+    except Exception:
+        pass
+
+    result_text = f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`"
+    if failed > 0 and last_error:
+        result_text += f"\n\n⚠️ **Reason for Failure:** `{last_error}`"
+
+    await status_msg.edit_text(result_text)                # Watermark
                 wm_path = file_path + "_wm.mp4"
                 final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
                 thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
