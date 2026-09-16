@@ -379,7 +379,9 @@ async def batch_process(client: Client, message: Message):
     if failed > 0 and last_error:
         result_text += f"\n\n⚠️ **Reason for Failure:** `{last_error}`"
 
-    await status_msg.edit_text(result_text)                # Watermark
+    await status_msg.edit_text(result_text)                
+    
+    # Watermark
                 wm_path = file_path + "_wm.mp4"
                 final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
                 thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
