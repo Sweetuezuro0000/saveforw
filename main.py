@@ -43,22 +43,18 @@ async def start_web_server():
 
 # ----------------- LINK PARSERS -----------------
 def parse_telegram_link(link: str):
-    # Private Topic: t.me/c/1234567890/99/456 -> (-1001234567890, 456)
     priv_topic = re.match(r"https?://t\.me/c/(\d+)/(\d+)/(\d+)", link)
     if priv_topic:
         return int("-100" + priv_topic.group(1)), int(priv_topic.group(3))
         
-    # Private Standard: t.me/c/1234567890/456 -> (-1001234567890, 456)
     priv_std = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
     if priv_std:
         return int("-100" + priv_std.group(1)), int(priv_std.group(2))
         
-    # Public Topic: t.me/channelname/99/456 -> ("channelname", 456)
     pub_topic = re.match(r"https?://t\.me/([^/]+)/(\d+)/(\d+)", link)
     if pub_topic:
         return pub_topic.group(1), int(pub_topic.group(3))
         
-    # Public Standard: t.me/channelname/456 -> ("channelname", 456)
     pub_std = re.match(r"https?://t\.me/([^/]+)/(\d+)", link)
     if pub_std:
         return pub_std.group(1), int(pub_std.group(2))
@@ -66,7 +62,6 @@ def parse_telegram_link(link: str):
     return None, None
 
 def parse_target_topic_link(link: str):
-    # Parses target group topic link: t.me/c/1234567890/55 or t.me/c/1234567890/55/123
     m = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
     if m:
         return int("-100" + m.group(1)), int(m.group(2))
@@ -263,7 +258,7 @@ async def batch_process(client: Client, message: Message):
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
 
-    # Load Dialogs to build Peer Cache (Fixes "Peer ID Invalid" issue)
+    # Load Dialogs to build Peer Cache
     await status_msg.edit_text("⏳ **Loading Dialogs & Resolving Channel Access...**")
     try:
         async for _ in user_app.get_dialogs(limit=200):
@@ -326,19 +321,33 @@ async def batch_process(client: Client, message: Message):
                 final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
                 thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
 
-                # Upload to Target Group Topic or DM
+                # Upload Logic: Check if file is video
                 up_msg = await message.reply_text(f"⬆️ Uploading msg `{msg.id}`...")
-                
-                upload_args = {
-                    "chat_id": dest_chat,
-                    "document": final_path,
-                    "caption": caption,
-                    "thumb": thumb
-                }
-                if dest_topic:
-                    upload_args["reply_to_message_id"] = dest_topic
+                ext = os.path.splitext(final_path)[1].lower()
+                is_video = ext in ['.mp4', '.mkv', '.avi', '.mov'] or bool(msg.video)
 
-                await client.send_document(**upload_args)
+                if is_video:
+                    upload_args = {
+                        "chat_id": dest_chat,
+                        "video": final_path,
+                        "caption": caption,
+                        "thumb": thumb,
+                        "supports_streaming": True
+                    }
+                    if dest_topic:
+                        upload_args["reply_to_message_id"] = dest_topic
+                    await client.send_video(**upload_args)
+                else:
+                    upload_args = {
+                        "chat_id": dest_chat,
+                        "document": final_path,
+                        "caption": caption,
+                        "thumb": thumb
+                    }
+                    if dest_topic:
+                        upload_args["reply_to_message_id"] = dest_topic
+                    await client.send_document(**upload_args)
+
                 await up_msg.delete()
 
                 # Cleanup
