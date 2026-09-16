@@ -5,7 +5,7 @@ import subprocess
 import traceback
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError, ChannelPrivate, UserNotParticipant
+from pyrogram.errors import FloodWait, RPCError
 from aiohttp import web
 
 # ----------------- CONFIGURATION -----------------
@@ -23,7 +23,9 @@ user_data = {
     "caption": None,
     "remwords": [],
     "replace": {},
-    "watermark": None
+    "watermark": None,
+    "target_chat": None,  # Target Group Chat ID
+    "target_topic": None  # Target Topic ID
 }
 
 # ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
@@ -39,7 +41,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ----------------- LINK PARSER -----------------
+# ----------------- LINK PARSERS -----------------
 def parse_telegram_link(link: str):
     # Private Topic: t.me/c/1234567890/99/456 -> (-1001234567890, 456)
     priv_topic = re.match(r"https?://t\.me/c/(\d+)/(\d+)/(\d+)", link)
@@ -61,6 +63,13 @@ def parse_telegram_link(link: str):
     if pub_std:
         return pub_std.group(1), int(pub_std.group(2))
         
+    return None, None
+
+def parse_target_topic_link(link: str):
+    # Parses target group topic link: t.me/c/1234567890/55 or t.me/c/1234567890/55/123
+    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
     return None, None
 
 # ----------------- CAPTION PROCESSOR -----------------
@@ -104,14 +113,16 @@ async def start_cmd(client, message: Message):
     msg = (
         "🤖 **Save Restricted Content Bot Loaded!**\n\n"
         "**Commands List:**\n"
-        "🔹 `/setsession <StringSession>` - Login for Restricted files\n"
+        "🔹 `/setsession <StringSession>` - Save Pyrogram Session\n"
+        "🔹 `/settarget <TopicLink>` - Set destination Group Topic\n"
+        "🔹 `/deltarget` - Reset target back to Bot DM\n"
         "🔹 `/batch <link> <count>` - Extract files in batch\n"
         "🔹 `/setcaption <text>` / `/delcaption` - Manage Custom Caption\n"
-        "🔹 `/remword <word>` - Remove specific words from caption\n"
-        "🔹 `/replace <old> <new>` - Replace words in caption\n"
-        "🔹 `/setthumb` - Reply to image to set Custom Thumbnail\n"
-        "🔹 `/delthumb` - Remove Custom Thumbnail\n"
-        "🔹 `/watermark <text>` - Watermark Video/PDF\n"
+        "🔹 `/remword <word>` - Remove specific words\n"
+        "🔹 `/replace <old> <new>` - Replace words\n"
+        "🔹 `/setthumb` - Reply to image to set Thumbnail\n"
+        "🔹 `/delthumb` - Delete Thumbnail\n"
+        "🔹 `/watermark <text>` - Watermark Video\n"
     )
     await message.reply(msg)
 
@@ -124,6 +135,33 @@ async def set_session(client, message: Message):
         await message.reply("✅ **Pyrogram String Session saved successfully!**")
     except IndexError:
         await message.reply("❌ **Usage:** `/setsession StringSessionHere`")
+
+@bot.on_message(filters.command("settarget"))
+async def set_target_topic(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    try:
+        link = message.text.split(" ", 1)[1].strip()
+        chat_id, topic_id = parse_target_topic_link(link)
+        if not chat_id or not topic_id:
+            return await message.reply("❌ **Invalid Target Link!**\nFormat: `/settarget https://t.me/c/1234567890/55`")
+        
+        user_data["target_chat"] = chat_id
+        user_data["target_topic"] = topic_id
+        await message.reply(
+            f"🎯 **Target Topic Saved Successfully!**\n\n"
+            f"📌 **Group ID:** `{chat_id}`\n"
+            f"📌 **Topic ID:** `{topic_id}`\n\n"
+            f"All extracted files will now be sent directly to this Topic."
+        )
+    except IndexError:
+        await message.reply("❌ **Usage:** `/settarget https://t.me/c/1234567890/55`")
+
+@bot.on_message(filters.command("deltarget"))
+async def del_target_topic(client, message: Message):
+    if message.from_user.id != OWNER_ID: return
+    user_data["target_chat"] = None
+    user_data["target_topic"] = None
+    await message.reply("🗑️ **Target Topic Removed.** Files will now be sent to Bot DM.")
 
 @bot.on_message(filters.command("setcaption"))
 async def set_caption(client, message: Message):
@@ -197,7 +235,7 @@ async def batch_process(client: Client, message: Message):
     
     args = message.text.split()
     if len(args) < 3:
-        return await message.reply("❌ **Usage:** `/batch <start_link> <count>`\nExample: `/batch https://t.me/c/12345/10 500`")
+        return await message.reply("❌ **Usage:** `/batch <start_link> <count>`\nExample: `/batch https://t.me/c/12345/10/20 500`")
     
     start_link = args[1]
     try:
@@ -209,9 +247,8 @@ async def batch_process(client: Client, message: Message):
     if not chat_id or not start_msg_id:
         return await message.reply("❌ **Invalid Telegram Link/Topic Format!**")
         
-    status_msg = await message.reply("⏳ **Initializing Session (No Updates Mode)...**")
+    status_msg = await message.reply("⏳ **Connecting User Session...**")
     
-    # CRITICAL FIX: no_updates=True disables background update listener task
     user_app = Client(
         "UserSession",
         api_id=API_ID,
@@ -226,17 +263,23 @@ async def batch_process(client: Client, message: Message):
     except Exception as e:
         return await status_msg.edit_text(f"❌ **Session Login Failed:** `{e}`\nPlease set your string session again using `/setsession`!")
 
-    # Cache channel hashes
+    # Resolve Channel Access
+    await status_msg.edit_text("⏳ **Resolving Private Channel Access...**")
     try:
-        async for _ in user_app.get_dialogs(limit=50):
-            pass
+        chat_obj = await user_app.get_chat(chat_id)
     except Exception as e:
-        print(f"Dialog load error: {e}")
+        await user_app.stop()
+        return await status_msg.edit_text(f"❌ **Channel Access Failed:** `{e}`\nCheck if your account is joined in the source channel.")
 
-    await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_id}`...**")
+    # Determine Destination
+    dest_chat = user_data["target_chat"] or message.chat.id
+    dest_topic = user_data["target_topic"] if user_data["target_chat"] else None
+
+    await status_msg.edit_text(f"🚀 **Extracting {count} items from `{chat_obj.title or chat_id}`...**")
     
     success, failed = 0, 0
-    
+    last_error = ""
+
     for current_id in range(start_msg_id, start_msg_id + count):
         try:
             msg = await user_app.get_messages(chat_id, current_id)
@@ -245,15 +288,16 @@ async def batch_process(client: Client, message: Message):
             try:
                 msg = await user_app.get_messages(chat_id, current_id)
             except Exception as ex:
-                print(f"Error getting msg {current_id}: {ex}")
+                last_error = f"Fetch Error: {ex}"
                 failed += 1
                 continue
         except Exception as e:
-            print(f"Error fetching message {current_id}: {e}")
+            last_error = f"Fetch Error: {e}"
             failed += 1
             continue
 
         if not msg or msg.empty:
+            last_error = "Empty or deleted message"
             failed += 1
             continue
 
@@ -261,52 +305,62 @@ async def batch_process(client: Client, message: Message):
             caption = process_caption(msg.caption or msg.text)
 
             if msg.media:
-                dl_msg = await message.reply_text(f"⬇️ Downloading message `{msg.id}`...")
+                dl_msg = await message.reply_text(f"⬇️ Downloading msg `{msg.id}`...")
                 file_path = await user_app.download_media(msg)
                 await dl_msg.delete()
 
                 if not file_path or not os.path.exists(file_path):
+                    last_error = "Download failed"
                     failed += 1
                     continue
 
-                # Apply Watermark
+                # Watermark
                 wm_path = file_path + "_wm.mp4"
                 final_path = apply_watermark(file_path, wm_path, user_data["watermark"])
-
-                # Thumbnail Setup
                 thumb = user_data["thumb"] if user_data["thumb"] and os.path.exists(user_data["thumb"]) else None
 
-                # Upload back using main Bot
-                up_msg = await message.reply_text(f"⬆️ Uploading message `{msg.id}`...")
-                await client.send_document(
-                    chat_id=message.chat.id,
-                    document=final_path,
-                    caption=caption,
-                    thumb=thumb
-                )
+                # Upload to Target Group Topic or DM
+                up_msg = await message.reply_text(f"⬆️ Uploading msg `{msg.id}`...")
+                
+                upload_args = {
+                    "chat_id": dest_chat,
+                    "document": final_path,
+                    "caption": caption,
+                    "thumb": thumb
+                }
+                if dest_topic:
+                    upload_args["reply_to_message_id"] = dest_topic
+
+                await client.send_document(**upload_args)
                 await up_msg.delete()
 
-                # Cleanup temp files
+                # Cleanup
                 if os.path.exists(file_path): os.remove(file_path)
                 if os.path.exists(wm_path): os.remove(wm_path)
 
                 success += 1
             elif msg.text:
-                await client.send_message(chat_id=message.chat.id, text=caption)
+                send_args = {
+                    "chat_id": dest_chat,
+                    "text": caption
+                }
+                if dest_topic:
+                    send_args["reply_to_message_id"] = dest_topic
+                    
+                await client.send_message(**send_args)
                 success += 1
 
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
-            print(f"Error processing msg {current_id}: {e}")
-            traceback.print_exc()
+            last_error = f"Process/Upload Error: {e}"
             failed += 1
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
 
-        # Update progress every 5 items
-        if (current_id - start_msg_id + 1) % 5 == 0 or (current_id - start_msg_id + 1) == count:
-            processed = current_id - start_msg_id + 1
+        # Update status
+        processed = current_id - start_msg_id + 1
+        if processed % 5 == 0 or processed == count:
             await status_msg.edit_text(f"📊 **Progress:** `{processed}/{count}`\n✅ **Success:** `{success}` | ❌ **Failed:** `{failed}`")
 
     try:
@@ -314,7 +368,11 @@ async def batch_process(client: Client, message: Message):
     except Exception:
         pass
 
-    await status_msg.edit_text(f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`")
+    result_text = f"🏁 **Batch Completed!**\n✅ **Total Sent:** `{success}`\n❌ **Failed:** `{failed}`"
+    if failed > 0 and last_error:
+        result_text += f"\n\n⚠️ **Reason for Failure:** `{last_error}`"
+
+    await status_msg.edit_text(result_text)
 
 # ----------------- MAIN EXECUTION -----------------
 if __name__ == "__main__":
