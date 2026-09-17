@@ -66,7 +66,7 @@ def process_caption(orig_caption: str) -> str:
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message: Message):
     text = (
-        "⚡ Bot Active on Render!\n\n"
+        "⚡ Bot Active on Paraweb Server!\n\n"
         "🔹 /setsession [StringSession]\n"
         "🔹 /settarget [Link]\n"
         "🔹 /deltarget\n"
