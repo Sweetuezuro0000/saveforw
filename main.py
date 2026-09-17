@@ -10,7 +10,7 @@ from aiohttp import web
 API_ID = int(os.environ.get("API_ID", "11271546"))
 API_HASH = os.environ.get("API_HASH", "1f1f4621cde774fef16b39dd8274e982")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
+OWNER_ID = int(os.environ.get("OWNER_ID", "8690092022"))
 bot = Client("SaveForwBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 user_data = {
@@ -63,8 +63,8 @@ def process_caption(orig_caption: str) -> str:
     return caption.strip()
 
 # ----------------- COMMANDS -----------------
-@bot.on_message(filters.command("start"))
-async def start_cmd(client, message: Message):
+@bot.on_message(filters.command("start") & filters.user(OWNER_ID))
+async def start_cmd(client, message: Message):    
     text = (
         "⚡ Bot Active on Paraweb Server!\n\n"
         "🔹 /setsession [StringSession]\n"
@@ -132,7 +132,7 @@ async def replace_word(client, message: Message):
         await message.reply("❌ Usage: `/replace [old] [new]`", parse_mode=enums.ParseMode.DISABLED)
 
 # ----------------- BATCH LOGIC -----------------
-@bot.on_message(filters.command("batch"))
+@bot.on_message(filters.command("batch") & filters.user(OWNER_ID))
 async def batch_process(client: Client, message: Message):
     if not user_data["session"]: return await message.reply("❌ Set session first via `/setsession`!")
     args = message.text.split()
