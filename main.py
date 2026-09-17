@@ -11,7 +11,6 @@ API_ID = int(os.environ.get("API_ID", "11271546"))
 API_HASH = os.environ.get("API_HASH", "1f1f4621cde774fef16b39dd8274e982")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# Render के लिए in_memory=True ज़रूरी है
 bot = Client("SaveForwBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 user_data = {
@@ -75,7 +74,6 @@ async def start_cmd(client, message: Message):
         "🔹 /setcaption [text] | /delcaption\n"
         "🔹 /remword [word] | /replace [old] [new]"
     )
-    # ParseMode.DISABLED से Markdown Entity Bounds का एरर नहीं आता
     await message.reply(text, parse_mode=enums.ParseMode.DISABLED)
 
 @bot.on_message(filters.command("setsession"))
@@ -147,11 +145,27 @@ async def batch_process(client: Client, message: Message):
     status_msg = await message.reply("⏳ Connecting User Session...")
     user_app = Client("UserSession", api_id=API_ID, api_hash=API_HASH, session_string=user_data["session"], in_memory=True)
     
-    try: await user_app.start()
-    except Exception as e: return await status_msg.edit_text(f"❌ Session Error: {e}", parse_mode=enums.ParseMode.DISABLED)
+    try:
+        await user_app.start()
+        # **PRIVATE CHANNEL FIX**: Fetch chat info first to cache access hash in memory
+        await user_app.get_chat(chat_id)
+    except Exception as e:
+        return await status_msg.edit_text(
+            f"❌ Chat Access Error: {e}\n\n👉 Make sure your Session Account is joined in this channel!",
+            parse_mode=enums.ParseMode.DISABLED
+        )
 
     dest_chat = user_data["target_chat"] or message.chat.id
     dest_topic = user_data["target_topic"] if user_data["target_chat"] else None
+
+    # Resolve destination chat access hash if it's a private target
+    if user_data["target_chat"]:
+        try:
+            await user_app.get_chat(dest_chat)
+            await bot.get_chat(dest_chat)
+        except Exception:
+            pass
+
     await status_msg.edit_text(f"🚀 Processing ({count} items)...")
 
     success, failed = 0, 0
