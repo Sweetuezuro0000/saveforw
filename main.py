@@ -22,7 +22,7 @@ user_data = {
     "target_topic": None
 }
 
-# ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
+# ----------------- HEALTH CHECK SERVER -----------------
 async def handle_ping(request):
     return web.Response(text="Bot is Alive!")
 
@@ -142,29 +142,19 @@ async def batch_process(client: Client, message: Message):
     chat_id, start_msg_id = parse_source_link(start_link)
     if not chat_id or not start_msg_id: return await message.reply("❌ Invalid Source Link!")
 
-    status_msg = await message.reply("⏳ Connecting User Session...")
+    status_msg = await message.reply("⏳ Connecting User Session & Fetching Dialogs...")
     user_app = Client("UserSession", api_id=API_ID, api_hash=API_HASH, session_string=user_data["session"], in_memory=True)
     
     try:
         await user_app.start()
-        # **PRIVATE CHANNEL FIX**: Fetch chat info first to cache access hash in memory
-        await user_app.get_chat(chat_id)
+        # 🔥 PRIVATE CHANNEL FIX: Populate peer cache in memory
+        async for _ in user_app.get_dialogs(limit=200):
+            pass
     except Exception as e:
-        return await status_msg.edit_text(
-            f"❌ Chat Access Error: {e}\n\n👉 Make sure your Session Account is joined in this channel!",
-            parse_mode=enums.ParseMode.DISABLED
-        )
+        return await status_msg.edit_text(f"❌ Session Error: {e}", parse_mode=enums.ParseMode.DISABLED)
 
     dest_chat = user_data["target_chat"] or message.chat.id
     dest_topic = user_data["target_topic"] if user_data["target_chat"] else None
-
-    # Resolve destination chat access hash if it's a private target
-    if user_data["target_chat"]:
-        try:
-            await user_app.get_chat(dest_chat)
-            await bot.get_chat(dest_chat)
-        except Exception:
-            pass
 
     await status_msg.edit_text(f"🚀 Processing ({count} items)...")
 
